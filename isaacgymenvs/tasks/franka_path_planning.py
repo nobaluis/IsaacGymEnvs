@@ -1,5 +1,6 @@
 import numpy as np
 import os
+import math
 import torch
 
 from isaacgym import gymutil
@@ -10,9 +11,9 @@ from isaacgym.torch_utils import *
 from isaacgymenvs.utils.torch_jit_utils import *
 from isaacgymenvs.tasks.base.vec_task import VecTask
 
-from utils import *
+from .utils import *
 from torch import Tensor
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, List
 from torchvision import transforms
 
 
@@ -35,10 +36,10 @@ class FrankaPathPlanning(VecTask):
 
         # Create dicts to pass to reward function
         self.reward_settings = {
-            'reward_clipped': self.cfg['env']['rewardClipped'],
-            'r_dis_scale': self.cfg['env']['distanceRewardScale'],
-            'r_orn_scale': self.cfg['env']['orientationRewardScale'],
-            'r_ctl_scale': self.cfg['env']['controlRewardScale']
+            'clipped': self.cfg['env']['rewardClipped'],
+            'scales': [self.cfg['env']['distanceRewardScale'],
+                       self.cfg['env']['orientationRewardScale'],
+                       self.cfg['env']['controlRewardScale']]
         }
 
         # Controller type
@@ -102,7 +103,7 @@ class FrankaPathPlanning(VecTask):
         # Refresh tensors
         self._refresh()
 
-    def create_sim(self, compute_device: int, graphics_device: int, physics_engine, sim_params: gymapi.SimParams) -> None:
+    def create_sim(self) -> None:
         self.sim_params.up_axis = gymapi.UP_AXIS_Z
         self.sim_params.gravity.x = 0
         self.sim_params.gravity.y = 0
@@ -379,8 +380,9 @@ class FrankaPathPlanning(VecTask):
         self._update_states()
 
     def compute_reward(self, actions: Tensor) -> None:
-        self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(self.reset_buf, self.progress_buf, actions,
-                                                                   self.states, self.max_episode_length)
+        self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
+            self.reset_buf, self.progress_buf, actions, self.states,
+            self.reward_settings['scales'], self.reward_settings['clipped'], self.max_episode_length)
 
     def _update_sensor_tensor(self) -> None:
         """Update the observation buffer with the image from both rgb and depth sensors
@@ -521,14 +523,14 @@ def orientation_error(q_desired: Tensor, q_current: Tensor) -> Tensor:
 
 @torch.jit.script
 def compute_franka_reward(reset_buf: Tensor, progress_buf: Tensor, actions: Tensor, states: Dict[str, Tensor],
-                          reward_settings: Dict[str, Any], max_episode_length: float) -> Tuple[Tensor, Tensor]:
+                          reward_scales: List[float], clipped: bool, max_episode_length: float) -> Tuple[Tensor, Tensor]:
     # compute errors
     pos_err = states['target_pos'] - states['hand_pos']
     rot_err = orientation_error(states['target_rot'], states['hand_rot'])
     # reward scale params
-    alpha = reward_settings['r_dis_scale']
-    beta = reward_settings['r_orn_scale']
-    gamma = reward_settings['r_ctl_scale']
+    alpha = reward_scales[0]
+    beta = reward_scales[1]
+    gamma = reward_scales[2]
     # compute rewards
     dis_reward = -torch.linalg.norm(pos_err, ord=2, dim=1)
     orn_reward = -torch.linalg.norm(rot_err, ord=2, dim=1)
@@ -536,12 +538,15 @@ def compute_franka_reward(reset_buf: Tensor, progress_buf: Tensor, actions: Tens
     reward = alpha * dis_reward + beta * orn_reward + gamma * ctl_reward
 
     # clipped reward functions
-    if reward_settings['reward_clipped']:
+    if clipped:
+        print(dis_reward)
         rd_clip = 1 / (10 * torch.clamp(torch.tanh(-dis_reward * math.pi), min=0) + 1)
         ro_clip = 1 / (10 * torch.clamp(torch.tanh(-orn_reward * math.pi), min=0) + 1)
         rc_clip = torch.clamp(torch.tanh(ctl_reward), max=0)
         reward = torch.clamp(alpha * rd_clip + beta * ro_clip + gamma * rc_clip, min=0)
 
     # compute reset
+    # TODO: reset condition based on hand_pos_z < min_height
     reset_buf = torch.where((progress_buf >= max_episode_length - 1), torch.ones_like(reset_buf), reset_buf)
     return reward, reset_buf
+
