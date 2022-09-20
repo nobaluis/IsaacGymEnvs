@@ -1,0 +1,54 @@
+# used to create the object
+name: FrankaPathPlanning
+
+physics_engine: ${..physics_engine}
+enableCameraSensors: True
+
+# if given, will override the device setting in gym.
+env:
+  numEnvs: ${resolve_default:128,${...num_envs}}
+  episodeLength: 600
+  enableDebugViz: True
+  enableLogging: False
+  envSpacing: 1.0
+  tableDimensions: [0.6, 1.0, 0.3]
+  terminationHeight: 0.3
+  dataDir: "../../data"
+  imgWidth: 64
+  imgHeight: 64
+  pathLen: 100
+
+  actionScale: 7.5
+  distanceRewardScale: 0.6
+  orientationRewardScale: 0.4
+  controlRewardScale: 0.01
+  rewardClipped: True
+  controlType: "osc"  # options {ocs, ik}
+
+  asset:
+    assetRoot: "../../assets"
+    assetFileNameFranka: "urdf/franka_description/robots/franka_panda.urdf"
+
+sim:
+  dt: 0.01667 # 1/60
+  substeps: 1
+  up_axis: "z"
+  use_gpu_pipeline: ${eq:${...pipeline},"gpu"}
+  gravity: [0.0, 0.0, -9.81]
+  physx:
+    num_threads: ${....num_threads}
+    solver_type: ${....solver_type}
+    use_gpu: ${contains:"cuda",${....sim_device}} # set to False to run on CPU
+    num_position_iterations: 8
+    num_velocity_iterations: 1
+    contact_offset: 0.005
+    rest_offset: 0.0
+    bounce_threshold_velocity: 0.2
+    max_depenetration_velocity: 1000.0
+    default_buffer_size_multiplier: 5.0
+    max_gpu_contact_pairs: 1048576 # 1024*1024
+    num_subscenes: ${....num_subscenes}
+    contact_collection: 0 # 0: CC_NEVER (don't collect contact info), 1: CC_LAST_SUBSTEP (collect only contacts on last substep), 2: CC_ALL_SUBSTEPS (default - all contacts)
+
+task:
+  randomize: False

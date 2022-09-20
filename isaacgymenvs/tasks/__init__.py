@@ -46,6 +46,7 @@ from .quadcopter import Quadcopter
 from .shadow_hand import ShadowHand
 from .allegro_hand import AllegroHand
 from .trifinger import Trifinger
+from .franka_path_planning import FrankaPathPlanning
 
 # Mappings from strings to environments
 isaacgym_task_map = {
@@ -68,4 +69,5 @@ isaacgym_task_map = {
     "Quadcopter": Quadcopter,
     "ShadowHand": ShadowHand,
     "Trifinger": Trifinger,
+    "FrankaPathPlanning": FrankaPathPlanning
 }
