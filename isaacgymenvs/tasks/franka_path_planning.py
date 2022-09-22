@@ -24,6 +24,9 @@ class FrankaPathPlanning(VecTask):
         self.sim = None
 
         self.max_episode_length = self.cfg['env']['episodeLength']
+        self.termination_height = self.cfg['env']['terminationHeight']
+        self.table_dimensions = self.cfg['env']['tableDimensions']
+        self.env_spacing = self.cfg['env']['envSpacing']
         self.action_scale = self.cfg['env']['actionScale']
         self.data_dir = self.cfg['env']['dataDir']
         self.img_width = self.cfg['env']['imgWidth']
@@ -129,16 +132,15 @@ class FrankaPathPlanning(VecTask):
         self.point_geom = gymutil.WireframeSphereGeometry(0.005, 24, 24, None, color=(1, 0, 0))
 
     def _create_envs(self) -> None:
-        spacing = 1.0
         num_per_row = int(math.sqrt(self.num_envs))
-        env_lower = gymapi.Vec3(-spacing, -spacing, 0.0)
-        env_upper = gymapi.Vec3(spacing, spacing, spacing)
+        env_lower = gymapi.Vec3(-self.env_spacing, -self.env_spacing, 0.0)
+        env_upper = gymapi.Vec3(self.env_spacing, self.env_spacing, self.env_spacing)
 
         # create table asset
-        table_dims = gymapi.Vec3(0.6, 1.0, 0.3)
         asset_options = gymapi.AssetOptions()
         asset_options.fix_base_link = True
-        table_asset = self.gym.create_box(self.sim, table_dims.x, table_dims.y, table_dims.z, asset_options)
+        table_x, table_y, table_z = self.table_dimensions
+        table_asset = self.gym.create_box(self.sim, table_x, table_y, table_z, asset_options)
 
         # load asset robot
         asset_options = gymapi.AssetOptions()
@@ -197,7 +199,7 @@ class FrankaPathPlanning(VecTask):
 
         # start pose for table
         table_pose = gymapi.Transform()
-        table_pose.p = gymapi.Vec3(0.425, 0.0, 0.5 * table_dims.z)
+        table_pose.p = gymapi.Vec3(0.425, 0.0, 0.5 * table_z)
 
         # start pose for sphere
         sphere_pose = gymapi.Transform()
@@ -247,7 +249,7 @@ class FrankaPathPlanning(VecTask):
             # sphere pose
             sphere_pose.p.x = table_pose.p.x  # + np.random.uniform(-0.02, 0.01)
             sphere_pose.p.y = table_pose.p.y  # + np.random.uniform(-0.03, 0.03)
-            sphere_pose.p.z = table_dims.z + 0.5 * (sphere_rad * 2)
+            sphere_pose.p.z = table_z + 0.5 * (sphere_rad * 2)
             sphere_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), -np.pi / 2)  # orn offset in world axis
             self.spheres_pos_list.append([sphere_pose.p.x, sphere_pose.p.y, sphere_pose.p.z])
 
@@ -305,7 +307,7 @@ class FrankaPathPlanning(VecTask):
         self.j_eef = jacobian[:, self.franka_hand_index - 1, :, :7]
 
         # Get mass matrix tensor
-        _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, "franka")
+        _massmatrix = self.gym.acquire_mass_matrix_tensor(self.sim, 'franka')
         mm = gymtorch.wrap_tensor(_massmatrix)
         self.mm = mm[:, :7, :7]  # only need elements corresponding to the franka arm
 
@@ -374,24 +376,30 @@ class FrankaPathPlanning(VecTask):
             .to(self.device).view((self.num_envs, 4))
 
     def _update_states(self) -> None:
+        # target points
         points_idx = self.target_point.unsqueeze(-1)  # (num_envs, 1)
         index = points_idx.repeat(1, 7)  # (num_envs, 7)
         index = index.unsqueeze(1)  # (num_envs, 1, 7)
         target_poses = torch.gather(self.targets_tensor, 1, index)
+        # end-effector state
+        hand_pos = self.rb_states[self.hand_idxs, :3]
+        hand_rot = self.rb_states[self.hand_idxs, 3:7]
+        hand_vel = self.rb_states[self.hand_idxs, 7:]
         self.states.update({
-            'hand_pos': self.rb_states[self.hand_idxs, :3],
-            'hand_rot': self.rb_states[self.hand_idxs, 3:7],
-            'hand_vel': self.rb_states[self.hand_idxs, 7:],
+            'hand_pos': hand_pos,
+            'hand_rot': hand_rot,
+            'hand_vel': hand_vel,
             'target_pos': target_poses[..., :3].view((self.num_envs, 3)),
             'target_rot': target_poses[..., 3:7].view((self.num_envs, 4))
         })
 
     def _refresh(self) -> None:
-        self.gym.refresh_rigid_body_state_tensor(self.sim)
-        self.gym.refresh_dof_state_tensor(self.sim)
-        self.gym.refresh_jacobian_tensors(self.sim)
-        self.gym.refresh_mass_matrix_tensors(self.sim)
-        self._update_states()
+        self.gym.refresh_actor_root_state_tensor(self.sim)  # actor root
+        self.gym.refresh_dof_state_tensor(self.sim)  # dof state
+        self.gym.refresh_rigid_body_state_tensor(self.sim)  # rigid body state
+        self.gym.refresh_jacobian_tensors(self.sim)  # jacobian
+        self.gym.refresh_mass_matrix_tensors(self.sim)  # mass matrix
+        self._update_states()  # targets
 
     def compute_reward(self, actions: Tensor) -> None:
         self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
@@ -414,6 +422,7 @@ class FrankaPathPlanning(VecTask):
             self.obs_buf[i, :] = torch.flatten(torch.cat((_rgb_norm_vec, _depth_norm_vec), dim=2))
 
     def compute_observations(self) -> Tensor:
+        self._refresh()  # update state and target tensors
         # render sensors and refresh camera tensors
         self.gym.render_all_camera_sensors(self.sim)
         self.gym.start_access_image_tensors(self.sim)
@@ -557,7 +566,6 @@ def compute_franka_reward(reset_buf: Tensor, progress_buf: Tensor, target_point:
 
     # clipped reward functions
     if clipped:
-        print(dis_reward)
         rd_clip = 1 / (10 * torch.clamp(torch.tanh(-dis_reward * math.pi), min=0) + 1)
         ro_clip = 1 / (10 * torch.clamp(torch.tanh(-orn_reward * math.pi), min=0) + 1)
         rc_clip = torch.clamp(torch.tanh(ctl_reward), max=0)
