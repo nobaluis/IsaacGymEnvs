@@ -8,7 +8,7 @@ enableCameraSensors: True
 env:
   numEnvs: ${resolve_default:128,${...num_envs}}
   episodeLength: 600
-  enableDebugViz: True
+  enableDebugViz: False
   enableLogging: False
   envSpacing: 1.0
   tableDimensions: [0.6, 1.0, 0.3]
@@ -19,6 +19,7 @@ env:
   pathLen: 100
 
   actionScale: 7.5
+  frankaDofNoise: 0.25
   distanceRewardScale: 0.6
   orientationRewardScale: 0.4
   controlRewardScale: 0.01

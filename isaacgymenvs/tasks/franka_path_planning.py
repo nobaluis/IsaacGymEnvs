@@ -28,6 +28,7 @@ class FrankaPathPlanning(VecTask):
         self.table_dimensions = self.cfg['env']['tableDimensions']
         self.env_spacing = self.cfg['env']['envSpacing']
         self.action_scale = self.cfg['env']['actionScale']
+        self.franka_dof_noise = self.cfg["env"]["frankaDofNoise"]
         self.data_dir = self.cfg['env']['dataDir']
         self.img_width = self.cfg['env']['imgWidth']
         self.img_height = self.cfg['env']['imgHeight']
@@ -62,7 +63,9 @@ class FrankaPathPlanning(VecTask):
         self.j_eef = None  # Jacobian for end effector
         self.mm = None  # Mass matrix
         self.rb_states = None  # State of all rigid bodies (n_envs, n_bodies, 13)
-        self.dof_state = None
+        self.dof_state_tensor = None
+        # self.root_states = None
+        # self.initial_root_states = None
         self.dof_pos = None
         self.dof_vel = None
         self.pos_action = None
@@ -73,6 +76,9 @@ class FrankaPathPlanning(VecTask):
         self.offset_rot = None
         self.points_array = None
         self.target_point = None
+        self.franka_dof_lower_limits = None
+        self.franka_dof_upper_limits = None
+        self.franka_effort_limits = None
 
         # Torchvision transformations
         self.process_rgb = transforms.ConvertImageDtype(torch.float32)
@@ -160,9 +166,14 @@ class FrankaPathPlanning(VecTask):
         franka_dof_props = self.gym.get_asset_dof_properties(franka_asset)
         franka_lower_limits = franka_dof_props['lower']
         franka_upper_limits = franka_dof_props['upper']
-        # franka_effort_limits = franka_dof_props['effort']
+        franka_effort_limits = franka_dof_props['effort']
         # franka_ranges = franka_upper_limits - franka_lower_limits
         franka_mids = 0.3 * (franka_upper_limits + franka_lower_limits)
+
+        # send franka limits to torch
+        self.franka_dof_lower_limits = to_torch(franka_lower_limits, device=self.device)
+        self.franka_dof_upper_limits = to_torch(franka_upper_limits, device=self.device)
+        self.franka_effort_limits = to_torch(franka_effort_limits, device=self.device)
 
         # config franka dof mode
         if self.control_type == 'ik':  # position mode
@@ -315,14 +326,14 @@ class FrankaPathPlanning(VecTask):
         _rb_states = self.gym.acquire_rigid_body_state_tensor(self.sim)
         self.rb_states = gymtorch.wrap_tensor(_rb_states)
 
-        # Get dof state tensor
+        # Get root state tensor
         # _actor_root_states = self.gym.acquire_actor_root_state_tensor(self.sim)
         # self.root_state = gymtorch.wrap_tensor(_actor_root_states).view(self.num_envs, -1, 13)  # (n_envs, 13)
 
         _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
-        self.dof_state = gymtorch.wrap_tensor(_dof_states)  # state of all joints (n_envs, n_dofs)
-        self.dof_pos = self.dof_state[:, 0].view(self.num_envs, 9, 1)
-        self.dof_vel = self.dof_state[:, 1].view(self.num_envs, 9, 1)
+        self.dof_state_tensor = gymtorch.wrap_tensor(_dof_states)  # state of all joints (n_envs, n_dofs)
+        self.dof_pos = self.dof_state_tensor[:, 0].view(self.num_envs, 9, 1)
+        self.dof_vel = self.dof_state_tensor[:, 1].view(self.num_envs, 9, 1)
 
         # Set action tensors
         self.pos_action = torch.zeros_like(self.dof_pos).squeeze(-1)
@@ -433,7 +444,19 @@ class FrankaPathPlanning(VecTask):
         return self.obs_buf
 
     def reset_idx(self, env_ids: Tensor) -> None:
-        env_ids_int32 = env_ids.to(dtype=torch.int32)
+
+        # Reset aget
+        reset_noise = torch.rand((len(env_ids), 9), device=self.device)
+        pos = tensor_clamp(
+            self.franka_default_dof_pos.unsqueeze(0) +
+            self.franka_dof_noise * 2.0 * (reset_noise - 0.5),
+            self.franka_dof_lower_limits.unsqueeze(0), self.franka_dof_upper_limits)
+        pos[:, -2:] = self.franka_dof_lower_limits[-2:]  # gripper closed
+
+        # set position and effort control to current position
+        self.pos_action[env_ids, :] = pos
+        self.effort_action[env_ids, :] = torch.zeros_like(pos)
+
         multi_env_ids_int32 = self.global_indices[env_ids, 0].flatten()
         self.gym.set_dof_position_target_tensor_indexed(self.sim,
                                                         gymtorch.unwrap_tensor(self.pos_action),
@@ -444,10 +467,9 @@ class FrankaPathPlanning(VecTask):
                                                         gymtorch.unwrap_tensor(multi_env_ids_int32),
                                                         len(multi_env_ids_int32))
         self.gym.set_dof_state_tensor_indexed(self.sim,
-                                              gymtorch.unwrap_tensor(self.dof_state.view(self.num_envs, -1, 2)),
+                                              gymtorch.unwrap_tensor(self.dof_state_tensor),
                                               gymtorch.unwrap_tensor(multi_env_ids_int32),
                                               len(multi_env_ids_int32))
-
         self.target_point[env_ids] = 0
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
