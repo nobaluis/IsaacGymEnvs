@@ -7,7 +7,7 @@ enableCameraSensors: True
 # if given, will override the device setting in gym.
 env:
   numEnvs: ${resolve_default:128,${...num_envs}}
-  episodeLength: 600
+  episodeLength: 500
   enableDebugViz: False
   enableLogging: False
   envSpacing: 1.0
@@ -20,8 +20,8 @@ env:
 
   actionScale: 7.5
   frankaDofNoise: 0.25
-  distanceRewardScale: 0.6
-  orientationRewardScale: 0.4
+  distanceRewardScale: 1.0
+  orientationRewardScale: 0.5
   controlRewardScale: 0.01
   rewardClipped: True
   controlType: "osc"  # options {ocs, ik}
