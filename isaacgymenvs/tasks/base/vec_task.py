@@ -335,8 +335,8 @@ class VecTask(Env):
             self.gym.simulate(self.sim)
 
         # to fix!
-        if self.device == 'cpu':
-            self.gym.fetch_results(self.sim, True)
+        # if self.device == 'cpu':
+        self.gym.fetch_results(self.sim, True)
 
         # compute observations, rewards, resets, ...
         self.post_physics_step()

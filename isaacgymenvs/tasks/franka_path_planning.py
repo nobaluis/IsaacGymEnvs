@@ -32,6 +32,7 @@ class FrankaPathPlanning(VecTask):
         self.data_dir = self.cfg['env']['dataDir']
         self.img_width = self.cfg['env']['imgWidth']
         self.img_height = self.cfg['env']['imgHeight']
+        self.gray_scale = self.cfg['env']['grayScale']
         self.path_len = self.cfg['env']['pathLen']
         self.debug_viz = self.cfg['env']['enableDebugViz']
         self.log_metrics = self.cfg['env']['enableLogging']
@@ -40,7 +41,6 @@ class FrankaPathPlanning(VecTask):
 
         # Create dicts to pass to reward function
         self.reward_settings = {
-            'clipped': self.cfg['env']['rewardClipped'],
             'scales': [self.cfg['env']['distanceRewardScale'],
                        self.cfg['env']['orientationRewardScale'],
                        self.cfg['env']['controlRewardScale']]
@@ -52,8 +52,8 @@ class FrankaPathPlanning(VecTask):
             'Invalid control type specified. Must be one of: {osc, ik}'
 
         # Dimensions
-        # obs include: img_rgb (3, 256, 256) + img_depth (1, 256, 256) = 4 * 256 * 256 = 262144
-        self.cfg['env']['numObservations'] = self.img_width * self.img_height * 4
+        self.img_channels = 2 if self.gray_scale else 4
+        self.cfg['env']['numObservations'] = self.img_width * self.img_height * self.img_channels
         # actions include: delta EEF if OSC or IK (6)
         self.cfg['env']['numActions'] = 6
 
@@ -82,8 +82,9 @@ class FrankaPathPlanning(VecTask):
         self.franka_default_dof_pos = None
 
         # Torchvision transformations
-        self.process_rgb = transforms.ConvertImageDtype(torch.float32)
-        self.process_depth = transforms.Lambda(lambda d: torch.div(torch.clamp(-d, max=1.2), 1.2))
+        self.to_float32 = transforms.ConvertImageDtype(torch.float32)
+        self.to_gray_scale = transforms.Grayscale(num_output_channels=1)
+        self.scale_depth = transforms.Lambda(lambda d: torch.clamp(-d, min=0.0, max=1.0))
 
         # Init VecTask
         super().__init__(config=self.cfg, rl_device=rl_device, sim_device=sim_device,
@@ -242,10 +243,10 @@ class FrankaPathPlanning(VecTask):
             self.envs.append(env)
 
             # add franka
-            franka_handle = self.gym.create_actor(env, franka_asset, franka_pose, 'franka', i, 0, 0)
+            franka_handle = self.gym.create_actor(env, franka_asset, franka_pose, 'franka', i, 2)
 
             # add table
-            self.gym.create_actor(env, table_asset, table_pose, 'table', i, 1, 0)
+            self.gym.create_actor(env, table_asset, table_pose, 'table', i, 0)
 
             # create sphere asset
             sphere_rad = np.random.uniform(0.075, 0.1)
@@ -262,7 +263,7 @@ class FrankaPathPlanning(VecTask):
             self.spheres_pos_list.append([sphere_pose.p.x, sphere_pose.p.y, sphere_pose.p.z])
 
             # add sphere
-            sphere_handle = self.gym.create_actor(env, sphere_asset, sphere_pose, 'sphere', i, 2, 0)
+            sphere_handle = self.gym.create_actor(env, sphere_asset, sphere_pose, 'sphere', i, 0)
 
             # get global index f sphere in rigid body state tensor
             sphere_idx = self.gym.get_actor_rigid_body_index(env, sphere_handle, 0, gymapi.DOMAIN_SIM)
@@ -280,10 +281,10 @@ class FrankaPathPlanning(VecTask):
             self.gym.set_actor_dof_properties(env, franka_handle, franka_dof_props)
 
             # set initial dof states
-            # self.gym.set_actor_dof_states(env, franka_handle, default_dof_state, gymapi.STATE_ALL)
+            self.gym.set_actor_dof_states(env, franka_handle, default_dof_state, gymapi.STATE_ALL)
 
             # set initial position targets
-            # self.gym.set_actor_dof_position_targets(env, franka_handle, default_dof_pos)
+            self.gym.set_actor_dof_position_targets(env, franka_handle, default_dof_pos)
 
             # get global index of hand in rigid body state tensor
             hand_idx = self.gym.find_actor_rigid_body_index(env, franka_handle, 'panda_hand', gymapi.DOMAIN_SIM)
@@ -299,8 +300,8 @@ class FrankaPathPlanning(VecTask):
             _depth_tensor = self.gym.get_camera_image_gpu_tensor(self.sim, env, cam_handle, gymapi.IMAGE_DEPTH)
 
             # wrap camera tensors in a pytorch tensors
-            rgb_tensor = gymtorch.wrap_tensor(_rgb_tensor)
-            depth_tensor = gymtorch.wrap_tensor(_depth_tensor)
+            rgb_tensor = gymtorch.wrap_tensor(_rgb_tensor)  # (W, H, 4)
+            depth_tensor = gymtorch.wrap_tensor(_depth_tensor)  # (W, H, 1)
             self.rgb_tensors.append(rgb_tensor)
             self.depth_tensors.append(depth_tensor)
         # setup data
@@ -403,7 +404,7 @@ class FrankaPathPlanning(VecTask):
         })
 
     def _refresh(self) -> None:
-        self.gym.refresh_actor_root_state_tensor(self.sim)  # actor root
+        # self.gym.refresh_actor_root_state_tensor(self.sim)  # actor root
         self.gym.refresh_dof_state_tensor(self.sim)  # dof state
         self.gym.refresh_rigid_body_state_tensor(self.sim)  # rigid body state
         self.gym.refresh_jacobian_tensors(self.sim)  # jacobian
@@ -411,28 +412,31 @@ class FrankaPathPlanning(VecTask):
         self._update_states()  # targets
 
     def compute_reward(self, actions: Tensor) -> None:
-        self.rew_buf[:], self.reset_buf[:] = compute_franka_reward(
+        self.rew_buf[:], self.reset_buf[:], self.target_point[:] = compute_franka_reward(
             self.reset_buf, self.progress_buf, self.target_point, actions, self.states,
-            self.reward_settings['scales'], self.reward_settings['clipped'], self.max_episode_length, self.path_len)
+            self.reward_settings['scales'], self.max_episode_length, self.path_len)
 
     def _update_sensor_tensor(self) -> None:
         """Update the observation buffer with the image from both rgb and depth sensors
 
         :return: void
         """
-        # input:
-        #  rgba_obs: [tensor(W, H, 4), ...] with len=num_envs
-        #  depth_obs: [tensor(W, H, 1), ...] with len=num_envs
-        # output:
-        #  rgbd_obs: tensor(num_envs, W * H * 4)
         for i in range(self.num_envs):
-            _rgb_norm_vec = self.process_rgb(self.rgb_tensors[i][..., :3].T).T  # (3, W, H)
-            _depth_norm_vec = self.process_depth(self.depth_tensors[i].T).unsqueeze(-1)  # (W, H)
-            self.obs_buf[i, :] = torch.flatten(torch.cat((_rgb_norm_vec, _depth_norm_vec), dim=2))
+            _color_tensor = self.to_float32(self.rgb_tensors[i][..., :3].T)  # (3, W, H)
+            if self.gray_scale:
+                _color_tensor = self.to_gray_scale(_color_tensor)  # (1, W, H)
+            _depth_tensor = self.scale_depth(self.depth_tensors[i].T).unsqueeze(0)  # (1, W, H)
+            # debug
+            # to_uint8 = transforms.ConvertImageDtype(torch.uint8)
+            # torchvision.io.write_png(to_uint8(_color_tensor).cpu(), 'imgs/color_tensor.png')
+            # torchvision.io.write_png(to_uint8(_depth_tensor).cpu(), 'imgs/depth_tensor.png')
+            # -----
+            self.obs_buf[i, :] = torch.flatten(torch.cat((_color_tensor, _depth_tensor), dim=0))
 
     def compute_observations(self) -> Tensor:
         self._refresh()  # update state and target tensors
         # render sensors and refresh camera tensors
+        self.gym.step_graphics(self.sim)
         self.gym.render_all_camera_sensors(self.sim)
         self.gym.start_access_image_tensors(self.sim)
         # get observations from sensors
@@ -500,7 +504,6 @@ class FrankaPathPlanning(VecTask):
         u = tensor_clamp(u.squeeze(-1),
                          -self.franka_effort_limits[:7].unsqueeze(0), self.franka_effort_limits[:7].unsqueeze(0))
         return u
-        # return u.squeeze(-1)
 
     def _compute_ik(self, dpose: Tensor) -> Tensor:
         """Compute the inverse kinematics using the damped least squares method
@@ -558,10 +561,10 @@ class FrankaPathPlanning(VecTask):
                 hand_target_pos.p = gymapi.Vec3(target_point_pos[0], target_point_pos[1], target_point_pos[2])
                 gymutil.draw_lines(self.point_geom, self.gym, self.viewer, self.envs[i], hand_target_pos)
 
-        # set the next target point when ee reaches the threshold
-        pos_err = self.states['target_pos'] - self.states['hand_pos']
-        pos_dis = torch.linalg.norm(pos_err, ord=2, dim=1)
-        self.target_point = torch.where((pos_dis <= 0.001), torch.add(self.target_point, 1), self.target_point)
+        # # set the next target point when ee reaches the threshold
+        # pos_err = self.states['target_pos'] - self.states['hand_pos']
+        # pos_dis = torch.linalg.norm(pos_err, ord=2, dim=1)
+        # self.target_point = torch.where(pos_dis <= 0.03, torch.add(self.target_point, 5), self.target_point)
     # end task definition
 
 # Pytorch JIT scripts
@@ -574,8 +577,8 @@ def orientation_error(q_desired: Tensor, q_current: Tensor) -> Tensor:
 
 @torch.jit.script
 def compute_franka_reward(reset_buf: Tensor, progress_buf: Tensor, target_point: Tensor, actions: Tensor,
-                          states: Dict[str, Tensor], reward_scales: List[float], clipped: bool,
-                          max_episode_length: float, path_len: int) -> Tuple[Tensor, Tensor]:
+                          states: Dict[str, Tensor], reward_scales: List[float], max_episode_length: float,
+                          path_len: int) -> Tuple[Tensor, Tensor, Tensor]:
     # compute errors
     pos_err = states['target_pos'] - states['hand_pos']
     rot_err = orientation_error(states['target_rot'], states['hand_rot'])
@@ -599,11 +602,14 @@ def compute_franka_reward(reset_buf: Tensor, progress_buf: Tensor, target_point:
     ctl_reward = torch.sum(actions ** 2, dim=-1)
 
     # X1 position reward - control penalty
-    reward = pos_reward * alpha - ctl_reward * gamma
-    # X2 position reward + orientation bonus - control penalty
-    reward = torch.where(pos_dis <= 0.05, pos_reward * 2.0 * alpha + orn_reward * beta - ctl_reward * gamma, reward)
-    # X4 position reward + orientation bonus - control penalty
-    reward = torch.where(pos_dis <= 0.001, pos_reward * 4.0 * alpha + orn_reward * beta - ctl_reward * gamma, reward)
+    reward = pos_reward - 0.01 * ctl_reward
+    # + orientation bonus when pos_dis < threshold
+    reward = torch.where(pos_dis <= 0.05, reward + 0.85 * orn_reward, reward)
+    # + extra bonus for reach target
+    reward = torch.where(pos_dis <= 0.03, reward + 10, reward)
+
+    # set the next target point when ee reaches the threshold
+    target_point = torch.where(pos_dis <= 0.03, torch.add(target_point, 5), target_point)
 
     # reset conditions
     # when episode ends
@@ -617,5 +623,5 @@ def compute_franka_reward(reset_buf: Tensor, progress_buf: Tensor, target_point:
     reset_buf = torch.where((p_x < 0.125) | (p_x > 0.725), torch.ones_like(reset_buf), reset_buf)
     reset_buf = torch.where((p_y < -0.5) | (p_y > 0.5), torch.ones_like(reset_buf), reset_buf)
     reset_buf = torch.where(p_z < 0.3, torch.ones_like(reset_buf), reset_buf)
-    return reward, reset_buf
+    return reward, reset_buf, target_point
 
