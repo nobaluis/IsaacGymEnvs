@@ -83,9 +83,11 @@ def texture_mapping(s, t) -> Tuple[float, float, float, float, float, float, flo
     n2 = math.sin(v) * math.sin(u)
     n3 = math.cos(v)
     # normal to quat
-    angle = math.atan2(n1, n3)
-    q0, q1, q2, q3 = (0., math.sin(angle/2), 0., math.cos(angle/2))
-    # return x, y, z, n4, n1, n2, n3  (this partially works)
+    # angle = math.atan2(n1, n3)
+    # q0, q1, q2, q3 = (0., math.sin(angle/2), 0., math.cos(angle/2))
+    # normal to quat from phi angle
+    r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1., 0., 0.), -v)
+    q0, q1, q2, q3 = r.x, r.y, r.z, r.w
     return x, y, z, q0, q1, q2, q3
 
 

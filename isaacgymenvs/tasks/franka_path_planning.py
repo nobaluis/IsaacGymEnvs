@@ -2,6 +2,8 @@ import numpy as np
 import os
 import math
 import torch
+import torchvision
+import random
 
 from isaacgym import gymutil
 from isaacgym import gymtorch
@@ -64,6 +66,9 @@ class FrankaPathPlanning(VecTask):
         self.mm = None  # Mass matrix
         self.rb_states = None  # State of all rigid bodies (n_envs, n_bodies, 13)
         self.dof_state_tensor = None
+        self.actor_state_tensor = None
+        self.sphere_actor_id = None
+        self.sphere_state = None
         # self.root_states = None
         # self.initial_root_states = None
         self.dof_pos = None
@@ -80,6 +85,10 @@ class FrankaPathPlanning(VecTask):
         self.franka_dof_upper_limits = None
         self.franka_effort_limits = None
         self.franka_default_dof_pos = None
+        self.texture_dict = dict()  # texture buffer
+        self.sphere_pos_list = []  # sphere random positions list
+        self.sphere_rot_list = []  # sphere random rotations (z-axis) list
+        self.sphere_rad_list = []  # sphere random radius list
 
         # Torchvision transformations
         self.to_float32 = transforms.ConvertImageDtype(torch.float32)
@@ -107,6 +116,15 @@ class FrankaPathPlanning(VecTask):
 
         # Set control limits (OCS)
         self.cmd_limit = to_torch([0.1, 0.1, 0.1, 0.5, 0.5, 0.5], device=self.device).unsqueeze(0)
+
+        # Load texture buffer
+        self.textures_files = get_textures(data_path=self.data_dir)  # get texture files
+        for i in range(self.num_envs * 2):
+            # pick random texture from files
+            _texture_id = np.random.choice(self.textures_files)
+            _texture_file = f'{self.data_dir}/textures/{_texture_id}'
+            # create texture handle
+            self.texture_dict[_texture_id.rstrip('.png')] = self.gym.create_texture_from_file(self.sim, _texture_file)
 
         # Reset all environments
         self.global_indices = torch.arange(self.num_envs * 3, dtype=torch.int32, device=self.device).view(self.num_envs, -1)
@@ -212,6 +230,7 @@ class FrankaPathPlanning(VecTask):
 
         # start pose for sphere
         sphere_pose = gymapi.Transform()
+        sphere_rot_offset = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), -math.pi / 2)
 
         # camera sensor properties
         cam_props = gymapi.CameraProperties()
@@ -224,16 +243,13 @@ class FrankaPathPlanning(VecTask):
         cam_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), -np.pi / 2)  # rotate -90 over y-axis
         cam_pose.p = gymapi.Vec3(0, 0, 0.0584)  # panda_finger length
 
-        # get texture files
-        self.textures_files = get_textures(data_path=self.data_dir)
-
         # create envs
         self.envs = []
         self.hand_idxs = []
-        self.texture_points_list = []
-        self.sphere_idxs = []
-        self.spheres_rad_list = []
-        self.spheres_pos_list = []
+        # self.texture_points_list = []
+        # self.sphere_idxs = []
+        # self.spheres_rad_list = []
+        # self.spheres_pos_list = []
         self.rgb_tensors = []
         self.depth_tensors = []
 
@@ -248,34 +264,41 @@ class FrankaPathPlanning(VecTask):
             # add table
             self.gym.create_actor(env, table_asset, table_pose, 'table', i, 0)
 
+            # sphere random props
+            sphere_rad = np.random.uniform(0.075, 0.125)
+            sphere_rot = np.random.uniform(0., 2 * math.pi)
+            sphere_px = table_pose.p.x + np.random.uniform(-0.02, 0.01)
+            sphere_py = table_pose.p.y + np.random.uniform(-0.03, 0.03)
+            sphere_pz = table_z + 0.5 * (sphere_rad * 2)
+
             # create sphere asset
-            sphere_rad = np.random.uniform(0.075, 0.1)
-            self.spheres_rad_list.append(sphere_rad)
             asset_options = gymapi.AssetOptions()
             asset_options.fix_base_link = True
             sphere_asset = self.gym.create_sphere(self.sim, sphere_rad, asset_options)
 
             # sphere pose
-            sphere_pose.p.x = table_pose.p.x  # + np.random.uniform(-0.02, 0.01)
-            sphere_pose.p.y = table_pose.p.y  # + np.random.uniform(-0.03, 0.03)
-            sphere_pose.p.z = table_z + 0.5 * (sphere_rad * 2)
-            sphere_pose.r = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), -np.pi / 2)  # orn offset in world axis
-            self.spheres_pos_list.append([sphere_pose.p.x, sphere_pose.p.y, sphere_pose.p.z])
+            sphere_pose.p = gymapi.Vec3(sphere_px, sphere_py, sphere_pz)
+            sphere_pose.r = sphere_rot_offset * gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), sphere_rot)
 
             # add sphere
-            sphere_handle = self.gym.create_actor(env, sphere_asset, sphere_pose, 'sphere', i, 0)
+            self.sphere_actor_id = self.gym.create_actor(env, sphere_asset, sphere_pose, 'sphere', i, 0)
+
+            # save sphere props
+            self.sphere_rad_list.append(sphere_rad)
+            self.sphere_rot_list.append(gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), -sphere_rot))
+            self.sphere_pos_list.append(gymapi.Vec3(sphere_px, sphere_py, sphere_pz))
 
             # get global index f sphere in rigid body state tensor
-            sphere_idx = self.gym.get_actor_rigid_body_index(env, sphere_handle, 0, gymapi.DOMAIN_SIM)
-            self.sphere_idxs.append(sphere_idx)
+            # sphere_idx = self.gym.get_actor_rigid_body_index(env, sphere_handle, 0, gymapi.DOMAIN_SIM)
+            # self.sphere_idxs.append(sphere_idx)
 
             # add texture to sphere
-            texture_id = np.random.choice(self.textures_files)
-            texture_file = f'{self.data_dir}/textures/{texture_id}'
-            texture_points = get_trajectory(texture_id.rstrip('.png'), data_path=self.data_dir)
-            self.texture_points_list.append(texture_points)
-            texture = self.gym.create_texture_from_file(self.sim, texture_file)
-            self.gym.set_rigid_body_texture(env, sphere_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION, texture)
+            # texture_id = np.random.choice(self.textures_files)
+            # texture_file = f'{self.data_dir}/textures/{texture_id}'
+            # texture_points = get_trajectory(texture_id.rstrip('.png'), data_path=self.data_dir)
+            # self.texture_points_list.append(texture_points)
+            # texture = self.gym.create_texture_from_file(self.sim, texture_file)
+            # self.gym.set_rigid_body_texture(env, sphere_handle, 0, gymapi.MESH_VISUAL_AND_COLLISION, texture)
 
             # set dof properties
             self.gym.set_actor_dof_properties(env, franka_handle, franka_dof_props)
@@ -324,10 +347,11 @@ class FrankaPathPlanning(VecTask):
         _rb_states = self.gym.acquire_rigid_body_state_tensor(self.sim)
         self.rb_states = gymtorch.wrap_tensor(_rb_states)
 
-        # Get root state tensor
-        # _actor_root_states = self.gym.acquire_actor_root_state_tensor(self.sim)
-        # self.root_state = gymtorch.wrap_tensor(_actor_root_states).view(self.num_envs, -1, 13)  # (n_envs, 13)
+        # Get actor state tensor
+        _actor_root_states = self.gym.acquire_actor_root_state_tensor(self.sim)
+        self.actor_state_tensor = gymtorch.wrap_tensor(_actor_root_states).view(self.num_envs, -1, 13)  # (n_envs, 13)
 
+        # Get dof state tensor
         _dof_states = self.gym.acquire_dof_state_tensor(self.sim)
         self.dof_state_tensor = gymtorch.wrap_tensor(_dof_states).view(self.num_envs, -1, 2)  # (n_envs, n_dofs)
 
@@ -338,52 +362,62 @@ class FrankaPathPlanning(VecTask):
         self.pos_action = torch.zeros((self.num_envs, 9), dtype=torch.float, device=self.device)
         self.effort_action = torch.zeros_like(self.pos_action)
 
+        # sphere state
+        self.sphere_state = self.actor_state_tensor[:, self.sphere_actor_id, :]
+
         # target point per env
         self.target_point = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
 
-        # 1-7 map texture points to world coordinates
-        # 1 - get sphere positions
-        sphere_pos_array = np.array(self.spheres_pos_list, dtype=np.float32)  # (num_envs, 3)
-
-        # 2 - get mapping from texture coord to sphere coord
+        # TODO: move this to another method
         self.points_array = np.empty((self.num_envs, self.path_len, 7), dtype=np.float32)
-        for i in range(self.num_envs):
-            # For each path convert (s, t) -> (x, y, z, q0...q3)
-            self.points_array[i, :, :] = trajectory_mapping(self.texture_points_list[i], self.spheres_rad_list[i])
-
-        # 3 - position offset from world -> sphere -> point in path
-        self.points_array[:, :, :3] += sphere_pos_array[:, np.newaxis, :]  # translation from origin to point
-        self.points_array = self.points_array.reshape((self.num_envs * self.path_len, 7))  # 2D array of points
-
-        # 4 - convert points pos to Vec3
         self.points_vec3 = np.empty(self.num_envs * self.path_len, dtype=gymapi.Vec3.dtype)
-        self.points_vec3['x'] = self.points_array[:, 0]
-        self.points_vec3['y'] = self.points_array[:, 1]
-        self.points_vec3['z'] = self.points_array[:, 2]
-
-        # 5 - convert points orn to Quat
         self.points_quat = np.empty(self.num_envs * self.path_len, dtype=gymapi.Quat.dtype)
-        self.points_quat['x'] = self.points_array[:, 3]
-        self.points_quat['y'] = self.points_array[:, 4]
-        self.points_quat['z'] = self.points_array[:, 5]
-        self.points_quat['w'] = self.points_array[:, 6]  # Try swap w and z
+        self.targets_tensor = to_torch(self.points_array, device=self.device)
 
-        # 6 - transformation offset: rotate to sphere normal + translation over z axis
-        transform = gymapi.Transform()
-        pos_offset = gymapi.Vec3(0, 0, -0.15)  # translation over z
-        for i in range(self.num_envs * self.path_len):
-            transform.p = self.points_vec3[i]
-            transform.r = self.points_quat[i]
-            new_pos = transform.transform_point(pos_offset)
-            self.points_array[i, :3] = np.array([new_pos.x, new_pos.y, new_pos.z])
-
-        # 7 - convert to tensor
-        self.targets_tensor = to_torch(self.points_array.reshape((self.num_envs, self.path_len, 7)), device=self.device)
-
-        # rotation to point inside the sphere (for panda_hand)
-        rot_q = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), math.pi)
-        self.offset_rot = torch.stack(self.num_envs * [torch.tensor([rot_q.x, rot_q.y, rot_q.z, rot_q.w])])\
-            .to(self.device).view((self.num_envs, 4))
+        # # 1-7 map texture points to world coordinates
+        # # 1 - get sphere positions
+        # sphere_pos_array = np.array(self.sphere_pos_list, dtype=np.float32)  # (num_envs, 3)
+        #
+        # # 2 - get mapping from texture coord to sphere coord
+        # self.points_array = np.empty((self.num_envs, self.path_len, 7), dtype=np.float32)
+        # for i in range(self.num_envs):
+        #     # For each path convert (s, t) -> (x, y, z, q0...q3)
+        #     self.points_array[i, :, :] = trajectory_mapping(self.texture_points_list[i], self.sphere_rad_list[i])
+        #
+        # # 3 - position offset from world -> sphere -> point in path
+        # self.points_array[:, :, :3] += sphere_pos_array[:, np.newaxis, :]  # translation from origin to point
+        # self.points_array = self.points_array.reshape((self.num_envs * self.path_len, 7))  # 2D array of points
+        #
+        # # 4 - convert points pos to Vec3
+        # self.points_vec3 = np.empty(self.num_envs * self.path_len, dtype=gymapi.Vec3.dtype)
+        # self.points_vec3['x'] = self.points_array[:, 0]
+        # self.points_vec3['y'] = self.points_array[:, 1]
+        # self.points_vec3['z'] = self.points_array[:, 2]
+        #
+        # # 5 - convert points orn to Quat
+        # self.points_quat = np.empty(self.num_envs * self.path_len, dtype=gymapi.Quat.dtype)
+        # self.points_quat['x'] = self.points_array[:, 3]
+        # self.points_quat['y'] = self.points_array[:, 4]
+        # self.points_quat['z'] = self.points_array[:, 5]
+        # self.points_quat['w'] = self.points_array[:, 6]  # Try swap w and z
+        #
+        # # 6 - transformation offset: rotate to sphere normal + translation over z axis
+        # transform = gymapi.Transform()
+        # pos_offset = gymapi.Vec3(0, 0, -0.15)  # translation over z
+        # for i in range(self.num_envs * self.path_len):
+        #     transform.p = self.points_vec3[i]
+        #     transform.r = self.points_quat[i]
+        #     new_pos = transform.transform_point(pos_offset)
+        #     self.points_array[i, :3] = np.array([new_pos.x, new_pos.y, new_pos.z])
+        #
+        # # 7 - convert to tensor
+        # self.targets_tensor = to_torch(self.points_array.reshape((self.num_envs, self.path_len, 7)), device=self.device)
+        #
+        # # rotation to point inside the sphere (for panda_hand)
+        # rot_q = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), math.pi)
+        # self.offset_rot = torch.stack(self.num_envs * [torch.tensor([rot_q.x, rot_q.y, rot_q.z, rot_q.w])])\
+        #     .to(self.device).view((self.num_envs, 4))
+        # # --------------------------------------------------------------------------------------------------------------
 
     def _update_states(self) -> None:
         # target points
@@ -404,7 +438,7 @@ class FrankaPathPlanning(VecTask):
         })
 
     def _refresh(self) -> None:
-        # self.gym.refresh_actor_root_state_tensor(self.sim)  # actor root
+        self.gym.refresh_actor_root_state_tensor(self.sim)  # actor root
         self.gym.refresh_dof_state_tensor(self.sim)  # dof state
         self.gym.refresh_rigid_body_state_tensor(self.sim)  # rigid body state
         self.gym.refresh_jacobian_tensors(self.sim)  # jacobian
@@ -445,6 +479,37 @@ class FrankaPathPlanning(VecTask):
         self.gym.end_access_image_tensors(self.sim)
         return self.obs_buf
 
+    def _compute_target_points(self, env_id: int, sphere_points: np.ndarray):
+        t1 = gymapi.Transform()  # Trans obj for ee offset
+        t2 = gymapi.Transform()  # Trans obj for sphere offset
+        ee_offset = gymapi.Vec3(0., 0., -0.15)  # translation over z  -0.15
+
+        t2.p = self.sphere_pos_list[env_id]
+        t2.r = self.sphere_rot_list[env_id]
+
+        for point_id in range(self.path_len):
+            idx = env_id * self.path_len + point_id
+            px, py, pz = sphere_points[point_id, :3]
+            qx, qy, qz, qw = sphere_points[point_id, 3:]
+            point_vec3 = gymapi.Vec3(px, py, pz)
+            point_quat = gymapi.Quat(qx, qy, qz, qw)
+
+            # translate offset distance over normal vector
+            t1.p = point_vec3
+            t1.r = point_quat
+            ee_pos = t1.transform_point(ee_offset)
+
+            # translate to sphere position and rotate sphere rotation
+            ee_pos = t2.transform_point(ee_pos)
+            sp_pos = t2.transform_point(point_vec3)
+            sp_rot = t2.r * point_quat
+
+            # update target points
+            self.points_vec3[idx] = (sp_pos.x, sp_pos.y, sp_pos.z)
+            self.points_quat[idx] = (sp_rot.x, sp_rot.y, sp_rot.z, sp_rot.w)
+            self.targets_tensor[env_id, point_id, :] = torch.tensor([ee_pos.x, ee_pos.y, ee_pos.z,
+                                                                     sp_rot.x, sp_rot.y, sp_rot.z, sp_rot.w])
+
     def reset_idx(self, env_ids: Tensor) -> None:
         # Reset aget
         reset_noise = torch.rand((len(env_ids), 9), device=self.device)
@@ -475,6 +540,21 @@ class FrankaPathPlanning(VecTask):
                                               gymtorch.unwrap_tensor(self.dof_state_tensor),
                                               gymtorch.unwrap_tensor(multi_env_ids_int32),
                                               len(multi_env_ids_int32))
+
+        # reset sphere and target points
+        for env_id in env_ids:
+            env = self.envs[env_id]
+            texture_id, texture = random.choice(list(self.texture_dict.items()))
+            color = np.random.choice(range(256), size=3) / 255
+            color_vec = gymapi.Vec3(color[0], color[1], color[2])
+            # set sphere texture and color
+            self.gym.set_rigid_body_texture(env, self.sphere_actor_id, 0, gymapi.MESH_VISUAL_AND_COLLISION, texture)
+            self.gym.set_rigid_body_color(env, self.sphere_actor_id, 0, gymapi.MESH_VISUAL, color_vec)
+            # compute new target points
+            texture_points = get_trajectory(texture_id, data_path=self.data_dir)  # (s, t)
+            sphere_points = trajectory_mapping(texture_points, self.sphere_rad_list[env_id])  # (x,y,z,rot)
+            self._compute_target_points(env_id, sphere_points)
+
         self.target_point[env_ids] = 0
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
@@ -557,7 +637,7 @@ class FrankaPathPlanning(VecTask):
                 gymutil.draw_lines(self.axes_geom, self.gym, self.viewer, self.envs[i], sphere_point_pos)
                 # panda_hand target pos
                 hand_target_pos = gymapi.Transform()
-                target_point_pos = self.points_array[pt_idx, :3]
+                target_point_pos = self.targets_tensor[i, self.target_point[i], :3]
                 hand_target_pos.p = gymapi.Vec3(target_point_pos[0], target_point_pos[1], target_point_pos[2])
                 gymutil.draw_lines(self.point_geom, self.gym, self.viewer, self.envs[i], hand_target_pos)
 
