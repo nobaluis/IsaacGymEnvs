@@ -99,7 +99,16 @@ class Env(ABC):
 
         self.control_freq_inv = config["env"].get("controlFrequencyInv", 1)
 
-        self.obs_space = spaces.Box(np.ones(self.num_obs) * -np.Inf, np.ones(self.num_obs) * np.Inf)
+        self.obs_img = False
+        if enable_camera_sensors:
+            self.obs_img = True
+            self.img_width = config["env"]["imgWidth"]
+            self.img_height = config["env"]["imgHeight"]
+            img_grayscale = config["env"]["grayScale"]
+            self.img_chs = 2 if img_grayscale else 4  # GD or RGBD
+            self.obs_space = spaces.Box(low=0.0, high=1.0, shape=(self.img_width, self.img_height, self.img_chs), dtype=np.float32)
+        else:
+            self.obs_space = spaces.Box(np.ones(self.num_obs) * -np.Inf, np.ones(self.num_obs) * np.Inf)
         self.state_space = spaces.Box(np.ones(self.num_states) * -np.Inf, np.ones(self.num_states) * np.Inf)
 
         self.act_space = spaces.Box(np.ones(self.num_actions) * -1., np.ones(self.num_actions) * 1.)
@@ -258,10 +267,11 @@ class VecTask(Env):
         inherit from this one, and are read in `step` and other related functions.
 
         """
-
         # allocate buffers
+        obs_size = (self.num_envs, self.img_width, self.img_height, self.img_chs) \
+            if self.obs_img else (self.num_envs, self.num_obs)
         self.obs_buf = torch.zeros(
-            (self.num_envs, self.num_obs), device=self.device, dtype=torch.float)
+            obs_size, device=self.device, dtype=torch.float)
         self.states_buf = torch.zeros(
             (self.num_envs, self.num_states), device=self.device, dtype=torch.float)
         self.rew_buf = torch.zeros(

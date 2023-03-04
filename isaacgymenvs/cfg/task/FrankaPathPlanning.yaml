@@ -7,7 +7,7 @@ enableCameraSensors: True
 # if given, will override the device setting in gym.
 env:
   numEnvs: ${resolve_default:256,${...num_envs}}
-  episodeLength: 500
+  episodeLength: 400
   enableDebugViz: False
   enableLogging: False
   envSpacing: 1.0
@@ -16,7 +16,7 @@ env:
   dataDir: "../../data"
   imgWidth: 64
   imgHeight: 64
-  grayScale: True
+  grayScale: False
   pathLen: 100
 
   actionScale: 7.5

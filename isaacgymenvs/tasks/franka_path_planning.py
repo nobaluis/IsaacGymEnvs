@@ -90,7 +90,11 @@ class FrankaPathPlanning(VecTask):
         self.sphere_rot_list = []  # sphere random rotations (z-axis) list
         self.sphere_rad_list = []  # sphere random radius list
 
+        # rotation offset between texture and sphere
+        self.sphere_rot_offset = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), -math.pi / 2)
+
         # Torchvision transformations
+        self.to_uint8 = transforms.ConvertImageDtype(torch.uint8)
         self.to_float32 = transforms.ConvertImageDtype(torch.float32)
         self.to_gray_scale = transforms.Grayscale(num_output_channels=1)
         self.scale_depth = transforms.Lambda(lambda d: torch.clamp(-d, min=0.0, max=1.0))
@@ -151,6 +155,14 @@ class FrankaPathPlanning(VecTask):
     def _create_viz_geoms(self) -> None:
         self.axes_geom = gymutil.AxesGeometry(0.5)
         self.point_geom = gymutil.WireframeSphereGeometry(0.005, 24, 24, None, color=(1, 0, 0))
+
+    def _sphere_rand_props(self, sphere_rad: float, table_px=0.425, table_py=0.0) -> Tuple[float, float, float, float]:
+        _, _, table_z = self.table_dimensions
+        rot = np.random.uniform(0., math.pi/2)  # 0, 2.0 * math.pi
+        px = table_px + np.random.uniform(-0.02, 0.01)
+        py = table_py + np.random.uniform(-0.03, 0.03)
+        pz = table_z + 0.5 * (sphere_rad * 2)
+        return rot, px, py, pz
 
     def _create_envs(self) -> None:
         num_per_row = int(math.sqrt(self.num_envs))
@@ -230,7 +242,6 @@ class FrankaPathPlanning(VecTask):
 
         # start pose for sphere
         sphere_pose = gymapi.Transform()
-        sphere_rot_offset = gymapi.Quat.from_axis_angle(gymapi.Vec3(1, 0, 0), -math.pi / 2)
 
         # camera sensor properties
         cam_props = gymapi.CameraProperties()
@@ -266,10 +277,7 @@ class FrankaPathPlanning(VecTask):
 
             # sphere random props
             sphere_rad = np.random.uniform(0.075, 0.125)
-            sphere_rot = np.random.uniform(0., 2 * math.pi)
-            sphere_px = table_pose.p.x + np.random.uniform(-0.02, 0.01)
-            sphere_py = table_pose.p.y + np.random.uniform(-0.03, 0.03)
-            sphere_pz = table_z + 0.5 * (sphere_rad * 2)
+            sphere_rot, sphere_px, sphere_py, sphere_pz = self._sphere_rand_props(sphere_rad)
 
             # create sphere asset
             asset_options = gymapi.AssetOptions()
@@ -278,7 +286,7 @@ class FrankaPathPlanning(VecTask):
 
             # sphere pose
             sphere_pose.p = gymapi.Vec3(sphere_px, sphere_py, sphere_pz)
-            sphere_pose.r = sphere_rot_offset * gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), sphere_rot)
+            sphere_pose.r = self.sphere_rot_offset * gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), sphere_rot)
 
             # add sphere
             self.sphere_actor_id = self.gym.create_actor(env, sphere_asset, sphere_pose, 'sphere', i, 0)
@@ -456,16 +464,18 @@ class FrankaPathPlanning(VecTask):
         :return: void
         """
         for i in range(self.num_envs):
-            _color_tensor = self.to_float32(self.rgb_tensors[i][..., :3].T)  # (3, W, H)
+            _color_tensor = self.to_float32(self.rgb_tensors[i][..., :3].T)  # (3, W, H) [0,1]
             if self.gray_scale:
                 _color_tensor = self.to_gray_scale(_color_tensor)  # (1, W, H)
-            _depth_tensor = self.scale_depth(self.depth_tensors[i].T).unsqueeze(0)  # (1, W, H)
+            _depth_tensor = self.scale_depth(self.depth_tensors[i].T).unsqueeze(0)  # (1, W, H) [0,1]
+
             # debug
             # to_uint8 = transforms.ConvertImageDtype(torch.uint8)
-            # torchvision.io.write_png(to_uint8(_color_tensor).cpu(), 'imgs/color_tensor.png')
-            # torchvision.io.write_png(to_uint8(_depth_tensor).cpu(), 'imgs/depth_tensor.png')
+            # torchvision.io.write_png(to_uint8(_color_tensor).cpu(), f'imgs/{i:02}_{self.progress_buf[i]:03}_rgb.png')
+            # torchvision.io.write_png(to_uint8(_depth_tensor).cpu(), f'imgs/{i:02}_{self.progress_buf[i]:03}_depth.png')
             # -----
-            self.obs_buf[i, :] = torch.flatten(torch.cat((_color_tensor, _depth_tensor), dim=0))
+            # self.obs_buf[i, :] = torch.flatten(torch.cat((_color_tensor, _depth_tensor), dim=0))  # (CH * W * H)
+            self.obs_buf[i, ...] = torch.cat((_color_tensor, _depth_tensor), dim=0).T  # (W, H, CH)
 
     def compute_observations(self) -> Tensor:
         self._refresh()  # update state and target tensors
@@ -545,16 +555,38 @@ class FrankaPathPlanning(VecTask):
         for env_id in env_ids:
             env = self.envs[env_id]
             texture_id, texture = random.choice(list(self.texture_dict.items()))
-            color = np.random.choice(range(256), size=3) / 255
+            # color = np.random.choice(range(256), size=3) / 255
+            color = np.array([1.0, 1.0, 1.0])
             color_vec = gymapi.Vec3(color[0], color[1], color[2])
             # set sphere texture and color
             self.gym.set_rigid_body_texture(env, self.sphere_actor_id, 0, gymapi.MESH_VISUAL_AND_COLLISION, texture)
             self.gym.set_rigid_body_color(env, self.sphere_actor_id, 0, gymapi.MESH_VISUAL, color_vec)
+            # set new sphere pose
+            sphere_rad = self.sphere_rad_list[env_id]  # isn't possible to change the rad after creating the asset
+            sphere_rot, sphere_px, sphere_py, sphere_pz = self._sphere_rand_props(sphere_rad)
+            self.sphere_rot_list[env_id] = gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 0, 1), -sphere_rot)
+            self.sphere_pos_list[env_id] = gymapi.Vec3(sphere_px, sphere_py, sphere_pz)
+            new_sphere_pose = gymapi.Transform()
+            new_sphere_pose.p = gymapi.Vec3(sphere_px, sphere_py, sphere_pz)
+            new_sphere_pose.r = self.sphere_rot_offset * gymapi.Quat.from_axis_angle(gymapi.Vec3(0, 1, 0), sphere_rot)
+            # set new sphere state
+            self.sphere_state[env_id, 0] = new_sphere_pose.p.x
+            self.sphere_state[env_id, 1] = new_sphere_pose.p.y
+            self.sphere_state[env_id, 2] = new_sphere_pose.p.z
+            self.sphere_state[env_id, 3] = new_sphere_pose.r.x
+            self.sphere_state[env_id, 4] = new_sphere_pose.r.y
+            self.sphere_state[env_id, 5] = new_sphere_pose.r.z
+            self.sphere_state[env_id, 6] = new_sphere_pose.r.w
             # compute new target points
             texture_points = get_trajectory(texture_id, data_path=self.data_dir)  # (s, t)
             sphere_points = trajectory_mapping(texture_points, self.sphere_rad_list[env_id])  # (x,y,z,rot)
             self._compute_target_points(env_id, sphere_points)
 
+        # update actor state tensor
+        multi_env_spheres_ids_int32 = self.global_indices[env_ids, 2].flatten()
+        self.gym.set_actor_root_state_tensor_indexed(
+            self.sim, gymtorch.unwrap_tensor(self.actor_state_tensor),
+            gymtorch.unwrap_tensor(multi_env_spheres_ids_int32), len(multi_env_spheres_ids_int32))
         self.target_point[env_ids] = 0
         self.progress_buf[env_ids] = 0
         self.reset_buf[env_ids] = 0
@@ -625,6 +657,8 @@ class FrankaPathPlanning(VecTask):
 
         # plot viz
         if self.viewer and self.debug_viz:
+            env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1)
+            self.target_point[env_ids] = 0
             self.gym.clear_lines(self.viewer)
             for i in range(self.num_envs):
                 # position and orn for the point in the sphere
@@ -670,6 +704,7 @@ def compute_franka_reward(reset_buf: Tensor, progress_buf: Tensor, target_point:
 
     # compute distance reward
     pos_dis = torch.linalg.norm(pos_err, ord=2, dim=1)
+    pos_exp = torch.exp(-pos_dis)
     pos_reward = 1.0 / (1.0 + pos_dis ** 2)
     pos_reward *= pos_reward
 
@@ -687,6 +722,11 @@ def compute_franka_reward(reset_buf: Tensor, progress_buf: Tensor, target_point:
     reward = torch.where(pos_dis <= 0.05, reward + 0.85 * orn_reward, reward)
     # + extra bonus for reach target
     reward = torch.where(pos_dis <= 0.03, reward + 10, reward)
+
+    # reward based on position and orientation - control penalty
+    # reward = pos_exp * orn_reward - 0.01 * ctl_reward
+    # # bonus for reach the target
+    # reward = torch.where(pos_dis <= 0.03, reward + 10, reward)
 
     # set the next target point when ee reaches the threshold
     target_point = torch.where(pos_dis <= 0.03, torch.add(target_point, 5), target_point)
